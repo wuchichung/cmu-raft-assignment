@@ -32,3 +32,6 @@ pkg
 .svn
 
 go.sum
+
+#
+tmp/*
