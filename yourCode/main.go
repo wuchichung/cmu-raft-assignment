@@ -217,7 +217,7 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 							// count vote
 							numVote += 1
 							if DEBUG {
-								fmt.Printf("%d get vote from %d, total %d\n", reply.To, reply.From, numVote)
+								fmt.Printf("%d get vote from %d, total %d, expect %d\n", reply.To, reply.From, numVote, rn.numMajority)
 							}
 
 							if numVote == rn.numMajority {
@@ -234,6 +234,10 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 									}
 									// reset
 									rn.restChan <- true
+									// debug message
+									if DEBUG {
+										fmt.Printf("%d become %v\n", rn.nodeId, rn.role)
+									}
 								}
 							}
 							// release lock
@@ -260,6 +264,9 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 				for hostID, client := range hostConnectionMap {
 
 					go func(hid int32, c raft.RaftNodeClient) {
+						if DEBUG {
+							fmt.Printf("%d's try to append entry %d\n", rn.nodeId, hid)
+						}
 						// get next index
 						nextLogIndex := rn.nextIndex[int(hid)]
 						prevLogIndex := 0
@@ -407,30 +414,37 @@ func (rn *raftNode) GetValue(ctx context.Context, args *raft.GetValueArgs) (*raf
 // reply: the RequestVote Reply Message
 func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
 	// TODO: Implement this!
-	if DEBUG {
-		fmt.Printf("%d request vote from %d\n", int(args.From), int(args.To))
-	}
-
+	// get node's last log index and last log term
 	lastLogIndex := len(rn.log)
 	lastLogTerm := 0
 	if lastLogIndex > 0 {
 		lastLogTerm = int(rn.log[lastLogIndex-1].Term)
 	}
 
+	// decide whether grant this vote
 	isVoteGranted := true
-	if rn.currentTerm > int(args.Term) {
+	if int(args.Term) < rn.currentTerm {
+		// if request's term is smaller than node's, reject
 		isVoteGranted = false
-	} else if lastLogIndex > int(args.LastLogIndex) {
+	} else if int(args.Term) == rn.currentTerm && rn.votedFor != -1 {
+		// if the node already voted in this term, do not vote again
 		isVoteGranted = false
-	} else if lastLogTerm > int(args.LastLogTerm) {
+	} else if int(args.LastLogIndex) < lastLogIndex {
+		// if request's last log index is smaller than node's, reject
+		isVoteGranted = false
+	} else if int(args.LastLogTerm) < lastLogTerm {
+		// if request's last log term is smaller than node's, reject
 		isVoteGranted = false
 	}
 
 	// update if vote is granted
 	if isVoteGranted {
+		rn.lock.Lock()
 		rn.votedFor = int(args.From)
 		rn.currentTerm = int(args.Term)
 		rn.role = raft.Role_Follower
+		rn.restChan <- true // reset timmer
+		rn.lock.Unlock()
 	}
 
 	// update reply
@@ -441,12 +455,10 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 		VoteGranted: isVoteGranted,
 	}
 
+	// print debug message
 	if DEBUG {
-		fmt.Printf("%d grante vote to %d %v\n", reply.From, reply.To, reply.VoteGranted)
+		fmt.Printf("%d request vote from %d, the vote is granted: %v\n", reply.To, reply.From, reply.VoteGranted)
 	}
-
-	// reset timmer
-	rn.restChan <- true
 
 	return &reply, nil
 }
@@ -461,52 +473,58 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
 	// TODO: Implement this
 
-	if DEBUG {
-		fmt.Printf("%d append entry to %d\n", args.From, args.To)
+	// flag to indicate successful or not
+	is_successful := true
+
+	// deprecated request from prev leader, reject
+	if args.Term < int32(rn.currentTerm) {
+		is_successful = false
 	}
 
-	var reply raft.AppendEntriesReply
-	reply.From = int32(rn.nodeId)
-	reply.To = args.From
+	// if request prevlogindex is valid (>0)
+	if args.PrevLogIndex > 0 {
+		// if request's prevlogindex is greater than node's log length, reject
+		if args.PrevLogIndex > int32(len(rn.log)) {
+			is_successful = false
+		}
 
-	// if args.Term < int32(rn.currentTerm) {
-	// 	reply.Success = false
-	// 	reply.Term = int32(rn.currentTerm)
-	// 	return &reply, nil
-	// }
+		// find a conflict, delete the existing entry and the ones following it
+		if int32(rn.log[args.PrevLogIndex-1].Term) != args.PrevLogTerm {
+			is_successful = false
+			rn.lock.Lock()
+			rn.log = rn.log[:args.PrevLogIndex]
+			rn.lock.Unlock()
+		}
+	}
 
-	// if args.PrevLogIndex >= int32(len(rn.log)) {
-	// 	reply.Success = false
-	// 	reply.Term = args.Term
-	// 	return &reply, nil
-	// }
+	// append new entries
+	if is_successful {
+		rn.lock.Lock()
+		rn.currentTerm = int(args.Term)
+		rn.log = append(rn.log, args.Entries...)
+		rn.votedFor = int(args.From)
+		// once we accept a appendentries request, we become a follower
+		if rn.role != raft.Role_Follower {
+			rn.role = raft.Role_Follower
+		}
+		// reset timmer
+		rn.restChan <- true
+		rn.lock.Unlock()
+	}
 
-	// if int32(rn.log[args.PrevLogIndex].Term) != args.PrevLogTerm {
-	// 	rn.log = rn.log[:args.PrevLogIndex]
-	// 	reply.Success = false
-	// 	reply.Term = args.Term
-	// 	return &reply, nil
-	// }
+	// init reply
+	reply := raft.AppendEntriesReply{
+		From:       int32(rn.nodeId),
+		To:         args.From,
+		Success:    is_successful,
+		Term:       int32(rn.currentTerm),
+		MatchIndex: 0,
+	}
 
-	// // append new entries
-	// for _, entry := range args.Entries {
-	// 	rn.log = append(rn.log, entry)
-	// }
-
-	// //
-	// if rn.commitIndex < int(args.LeaderCommit) {
-	// 	if int(args.LeaderCommit) > len(rn.log) {
-	// 		rn.commitIndex = len(rn.log)
-	// 	} else {
-	// 		rn.commitIndex = int(args.LeaderCommit)
-	// 	}
-	// }
-
-	reply.Success = true
-	reply.Term = args.Term
-
-	// reset timmer
-	rn.restChan <- true
+	// print debug message
+	if DEBUG {
+		fmt.Printf("%d append entry to %d, the states is %v\n", args.From, args.To, reply.Success)
+	}
 
 	return &reply, nil
 }
