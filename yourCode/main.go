@@ -380,15 +380,18 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 	var ret raft.ProposeReply
 
 	if rn.role == raft.Role_Leader {
-		rn.lock.Lock()
 		// append entry to local log
-		rn.log = append(rn.log, &raft.LogEntry{Term: int32(rn.currentTerm), Op: args.Op, Key: args.Key, Value: args.V})
+		rn.lock.Lock()
+		rn.log = append(rn.log, &raft.LogEntry{
+			Term:  int32(rn.currentTerm),
+			Op:    args.Op,
+			Key:   args.Key,
+			Value: args.V})
 		rn.lock.Unlock()
 		// wait for commit
 		<-rn.commitChan
 		// apply entry
 		ret.CurrentLeader = int32(rn.nodeId)
-		//
 		if args.Op == raft.Operation_Put {
 			rn.lock.Lock()
 			rn.store[args.Key] = int(args.V)
@@ -397,14 +400,14 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 		} else if args.Op == raft.Operation_Delete {
 			rn.lock.Lock()
 			_, ok := rn.store[args.Key]
-			ret.Status = raft.Status_KeyNotFound
 			if ok {
 				delete(rn.store, args.Key)
 				ret.Status = raft.Status_OK
+			} else {
+				ret.Status = raft.Status_KeyNotFound
 			}
 			rn.lock.Unlock()
 		}
-
 	} else if rn.role == raft.Role_Follower {
 		ret.CurrentLeader = int32(rn.votedFor)
 		ret.Status = raft.Status_WrongNode
@@ -473,7 +476,9 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 		rn.lock.Lock()
 		rn.votedFor = int(args.From)
 		rn.currentTerm = int(args.Term)
-		rn.role = raft.Role_Follower
+		if rn.role != raft.Role_Follower {
+			rn.role = raft.Role_Follower // update role
+		}
 		rn.restChan <- true // reset timmer
 		rn.lock.Unlock()
 	}
@@ -505,21 +510,20 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 	// deprecated request from prev leader, reject
 	if args.Term < int32(rn.currentTerm) {
 		is_successful = false
-	}
-
-	// if request prevlogindex is valid (>0)
-	if args.PrevLogIndex > 0 {
-		// if request's prevlogindex is greater than node's log length, reject
-		if args.PrevLogIndex > int32(len(rn.log)) {
-			is_successful = false
-		}
-
-		// find a conflict, delete the existing entry and the ones following it
-		if int32(rn.log[args.PrevLogIndex-1].Term) != args.PrevLogTerm {
-			is_successful = false
-			rn.lock.Lock()
-			rn.log = rn.log[:args.PrevLogIndex]
-			rn.lock.Unlock()
+	} else {
+		// if request prevlogindex is valid (>0)
+		if args.PrevLogIndex > 0 {
+			// if request's prevlogindex is greater than node's log length, reject
+			if args.PrevLogIndex > int32(len(rn.log)) {
+				is_successful = false
+			}
+			// find a conflict, delete the existing entry and the ones following it
+			if int32(rn.log[args.PrevLogIndex-1].Term) != args.PrevLogTerm {
+				is_successful = false
+				rn.lock.Lock()
+				rn.log = rn.log[:args.PrevLogIndex]
+				rn.lock.Unlock()
+			}
 		}
 	}
 
@@ -533,12 +537,11 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 		if rn.role != raft.Role_Follower {
 			rn.role = raft.Role_Follower
 		}
-
 		// append entry log
 		rn.log = append(rn.log, args.Entries...)
 		//
 		matchIndex = int(args.PrevLogIndex) + len(args.Entries)
-		// apply entries in log
+		// apply entries
 		leader_commit := int(args.LeaderCommit)
 		if leader_commit > rn.commitIndex {
 			// get start index
