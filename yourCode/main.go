@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,7 +15,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-const DEBUG bool = true
+const DEBUG bool = false
 
 func main() {
 	ports := os.Args[2]
@@ -46,33 +45,6 @@ func main() {
 
 	// Run the raft node forever.
 	select {}
-}
-
-func getCommitIndex(matchIndex map[int]int, numMajority int) int {
-
-	matchIndices := make([]int, 0, len(matchIndex))
-	for _, v := range matchIndex {
-		if v > 0 {
-			matchIndices = append(matchIndices, v)
-		}
-	}
-
-	commitIndex := 0
-	if len(matchIndices) >= numMajority {
-		//
-		sort.Ints(matchIndices)
-		//
-		for i, v := range matchIndices {
-			if len(matchIndices)-i < numMajority {
-				break
-			} else {
-				commitIndex = v
-			}
-		}
-	}
-
-	return commitIndex
-
 }
 
 type raftNode struct {
@@ -310,11 +282,7 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 						if nextLogIndex > 0 {
 							entries = append(entries, rn.log[nextLogIndex-1:]...)
 						}
-						//
 						rn.lock.Unlock()
-
-						//
-						fmt.Printf("%d,%d, nextLogIndex: %d, length log: %d, length entry: %d \n", rn.nodeId, hid, nextLogIndex, len(rn.log), len(entries))
 
 						// send AppendEntries request
 						reply, err := c.AppendEntries(ctx, &raft.AppendEntriesArgs{
@@ -331,21 +299,33 @@ func NewRaftNode(myport int, nodeidPortMap map[int]int, nodeId, heartBeatInterva
 						if err == nil {
 							rn.lock.Lock()
 							if reply.Success {
-								fmt.Printf("%d receive succss from %d. matchindex is %d\n", rn.nodeId, reply.From, reply.MatchIndex)
 								// update next index
 								rn.nextIndex[int(hid)] = int(reply.MatchIndex) + 1
 								// update match index
 								rn.matchIndex[int(hid)] = int(reply.MatchIndex)
-								// calculate the commitindex from matchIndex
-								commitIndex := getCommitIndex(rn.matchIndex, rn.numMajority)
-								// the the commitIndex is updated
-								if commitIndex > rn.commitIndex {
-									// update the commitindex
-									rn.commitIndex = commitIndex
-									if rn.commitIndex == len(rn.log) {
+								// check whether rn.commitIndex + 1 commit index already get enough commit
+								keep_search := true
+								for keep_search {
+									// propose commit index and verify with the match index
+									newCommitIndex := rn.commitIndex + 1
+									newCommitIndexCount := 1
+									for _, m_index := range rn.matchIndex {
+										if m_index >= newCommitIndex {
+											newCommitIndexCount++
+										}
+									}
+
+									if newCommitIndexCount == rn.numMajority {
+										// update commit index
+										rn.commitIndex = newCommitIndex
+										// trigger commit channel
 										rn.commitChan <- true
+									} else if newCommitIndexCount < rn.numMajority {
+										//
+										keep_search = false
 									}
 								}
+
 							} else {
 								// decrement nextIndex
 								rn.nextIndex[int(hid)]--
@@ -397,11 +377,6 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 	*/
 
 	// TODO: Implement this!
-	if DEBUG {
-		fmt.Printf("%d Receive propose from client\n", rn.nodeId)
-	}
-
-	//
 	var ret raft.ProposeReply
 
 	if rn.role == raft.Role_Leader {
@@ -409,7 +384,6 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 		// append entry to local log
 		rn.log = append(rn.log, &raft.LogEntry{Term: int32(rn.currentTerm), Op: args.Op, Key: args.Key, Value: args.V})
 		rn.lock.Unlock()
-		fmt.Printf("%d log length %d\n", rn.nodeId, len(rn.log))
 		// wait for commit
 		<-rn.commitChan
 		// apply entry
@@ -435,9 +409,6 @@ func (rn *raftNode) Propose(ctx context.Context, args *raft.ProposeArgs) (*raft.
 		ret.CurrentLeader = int32(rn.votedFor)
 		ret.Status = raft.Status_WrongNode
 	}
-
-	fmt.Printf("%d Reply %v\n", rn.nodeId, ret.Status)
-
 	return &ret, nil
 }
 
@@ -513,11 +484,6 @@ func (rn *raftNode) RequestVote(ctx context.Context, args *raft.RequestVoteArgs)
 		To:          args.From,
 		Term:        int32(rn.currentTerm),
 		VoteGranted: isVoteGranted,
-	}
-
-	// print debug message
-	if DEBUG {
-		fmt.Printf("%d request vote from %d, the vote is granted: %v\n", reply.To, reply.From, reply.VoteGranted)
 	}
 
 	return &reply, nil
@@ -607,11 +573,6 @@ func (rn *raftNode) AppendEntries(ctx context.Context, args *raft.AppendEntriesA
 		Success:    is_successful,
 		Term:       int32(rn.currentTerm),
 		MatchIndex: int32(matchIndex),
-	}
-
-	// print debug message
-	if DEBUG {
-		fmt.Printf("%d append entry to %d, the states is %v\n", args.From, args.To, reply.Success)
 	}
 
 	return &reply, nil
